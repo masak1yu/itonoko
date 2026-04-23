@@ -12,148 +12,124 @@ module Itonoko
   module Parser
     class XmlParser
       def parse(xml)
-        @doc = XML::Document.new
+        @doc        = XML::Document.new
         @doc.errors = []
-        scanner = StringScanner.new(xml.to_s)
         @open_stack = [@doc]
-        tokenize(scanner)
+        @buf        = +""
+        tokenize_and_build(StringScanner.new(xml.to_s))
         @doc
       end
 
       private
 
-      def tokenize(scanner)
-        buf = +""
+      def tokenize_and_build(sc)
+        until sc.eos?
+          if sc.scan(/<!--/)
+            flush_buf
+            comment = scan_until(sc, /-->/)
+            @open_stack.last.append_child(XML::Comment.new(comment, @doc))
 
-        until scanner.eos?
-          if scanner.scan(/<!--/)
-            flush_text(buf)
-            buf = +""
-            comment = +""
-            until scanner.eos?
-              if scanner.scan(/-->/)
-                break
-              else
-                comment << scanner.getch
-              end
-            end
-            @open_stack.last.add_child(XML::Comment.new(comment, @doc))
+          elsif sc.scan(/<!\[CDATA\[/)
+            flush_buf
+            cdata = scan_until(sc, /\]\]>/)
+            @open_stack.last.append_child(XML::CDATA.new(cdata, @doc))
 
-          elsif scanner.scan(/<!\[CDATA\[/)
-            flush_text(buf)
-            buf = +""
-            cdata = +""
-            until scanner.eos?
-              if scanner.scan(/\]\]>/)
-                break
-              else
-                cdata << scanner.getch
-              end
-            end
-            @open_stack.last.add_child(XML::CDATA.new(cdata, @doc))
+          elsif sc.scan(/<\?xml\s/i)
+            sc.scan(/[^?]*/)
+            sc.scan(/\?>/)
 
-          elsif scanner.scan(/<\?xml\s/i)
-            scanner.scan(/[^?]*/)
-            scanner.scan(/\?>/)
+          elsif sc.scan(/<\?/)
+            target  = sc.scan(/[^\s?]+/) || ""
+            sc.scan(/\s*/)
+            content = scan_until(sc, /\?>/)
+            @open_stack.last.append_child(XML::ProcessingInstruction.new(target, content, @doc))
 
-          elsif scanner.scan(/<\?/)
-            target = scanner.scan(/[^\s?]+/) || ""
-            scanner.scan(/\s*/)
-            content = +""
-            until scanner.eos?
-              if scanner.scan(/\?>/)
-                break
-              else
-                content << scanner.getch
-              end
-            end
-            @open_stack.last.add_child(XML::ProcessingInstruction.new(target, content, @doc))
+          elsif sc.scan(/<!DOCTYPE/i)
+            sc.scan(/[^>]*/)
+            sc.scan(/>/)
 
-          elsif scanner.scan(/<!DOCTYPE/i)
-            scanner.scan(/[^>]*/)
-            scanner.scan(/>/)
-
-          elsif scanner.scan(/<\//)
-            flush_text(buf)
-            buf = +""
-            name = scanner.scan(/[^\s>\/]+/) || ""
-            scanner.scan(/[^>]*/)
-            scanner.scan(/>/)
+          elsif sc.scan(/<\//)
+            flush_buf
+            name = sc.scan(/[^\s>\/]+/) || ""
+            sc.scan(/[^>]*/)
+            sc.scan(/>/)
             handle_end_tag(name)
 
-          elsif scanner.scan(/</)
-            if scanner.check(/[a-zA-Z_]|[^\x00-\x7F]/)
-              flush_text(buf)
-              buf = +""
-              name = scanner.scan(/[^\s>\/]+/) || ""
-              attrs = {}
-              parse_attributes(scanner, attrs)
-              self_closing = !scanner.scan(/\//).nil?
-              scanner.scan(/>/)
-              handle_start_tag(name, attrs, self_closing)
-            else
-              buf << "<"
-            end
+          elsif sc.scan(/</) && sc.check(/[a-zA-Z_]|[^\x00-\x7F]/)
+            flush_buf
+            name  = sc.scan(/[^\s>\/]+/) || ""
+            attrs = {}
+            scan_attributes(sc, attrs)
+            self_closing = sc.scan(/\//) ? true : false
+            sc.scan(/>/)
+            handle_start_tag(name, attrs, self_closing)
 
+          elsif (chunk = sc.scan(/[^<]+/))
+            @buf << chunk
           else
-            buf << scanner.getch
+            @buf << sc.getch
           end
         end
-
-        flush_text(buf)
+        flush_buf
       end
 
-      def parse_attributes(scanner, attrs)
+      def scan_until(sc, pattern)
+        content = +""
+        until sc.eos?
+          break if sc.scan(pattern)
+          content << sc.getch
+        end
+        content
+      end
+
+      def scan_attributes(sc, attrs)
         loop do
-          scanner.scan(/\s+/)
-          break if scanner.eos? || scanner.check(/[>\/]/)
-
-          attr_name = scanner.scan(/[^\s=>\/"':]+/)
-          break unless attr_name
-
-          scanner.scan(/\s*/)
-          if scanner.scan(/=/)
-            scanner.scan(/\s*/)
-            if scanner.scan(/"/)
-              val = scanner.scan(/[^"]*/)
-              scanner.scan(/"/)
-              attrs[attr_name] = decode_entities(val || "")
-            elsif scanner.scan(/'/)
-              val = scanner.scan(/[^']*/)
-              scanner.scan(/'/)
-              attrs[attr_name] = decode_entities(val || "")
+          sc.scan(/\s+/)
+          break if sc.eos? || sc.check(/[>\/]/)
+          attr_name = sc.scan(/[^\s=>\/"':]+/) or break
+          sc.scan(/\s*/)
+          if sc.scan(/=/)
+            sc.scan(/\s*/)
+            val = if sc.scan(/"/)
+              v = sc.scan(/[^"]*/) || ""
+              sc.scan(/"/)
+              v
+            elsif sc.scan(/'/)
+              v = sc.scan(/[^']*/) || ""
+              sc.scan(/'/)
+              v
             else
-              val = scanner.scan(/[^\s>]+/) || ""
-              attrs[attr_name] = decode_entities(val)
+              sc.scan(/[^\s>]+/) || ""
             end
+            attrs[attr_name] = decode_entities(val)
           else
             attrs[attr_name] = attr_name
           end
         end
       end
 
-      def flush_text(buf)
-        return if buf.empty?
-        text = decode_entities(buf)
-        @open_stack.last.add_child(XML::Text.new(text, @doc)) unless text.empty?
-        buf.clear
+      def flush_buf
+        return if @buf.empty?
+        text = decode_entities(@buf)
+        @open_stack.last.append_child(XML::Text.new(text, @doc)) unless text.empty?
+        @buf.clear
       end
 
       def decode_entities(str)
+        return str.dup unless str.include?("&")
         str.gsub(/&([^;\s]{1,10});/) { Parser.decode_entity($1) }
       end
 
       def handle_start_tag(name, attrs, self_closing)
         node = XML::Node.new(XML::Node::ELEMENT_NODE, name, @doc)
         attrs.each { |k, v| node[k] = v }
-        @open_stack.last.add_child(node)
+        @open_stack.last.append_child(node)
         @open_stack.push(node) unless self_closing
       end
 
       def handle_end_tag(name)
         idx = @open_stack.rindex { |n| n.node_name == name }
-        return unless idx && idx > 0
-        @open_stack.slice!(idx..)
+        @open_stack.slice!(idx..) if idx && idx > 0
       end
     end
   end
