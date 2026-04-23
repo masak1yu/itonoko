@@ -113,18 +113,24 @@ xml.xpath("//book[@genre='nonfiction']/title/text()").map(&:text)
 
 ## Benchmark
 
-Compared against nokogiri 1.19.2 on Ruby 3.4.3 (arm64-darwin), 300 iterations:
+Compared against nokogiri on Ruby 4.1.0dev trunk (arm64-darwin), 300 iterations:
 
 | Task | itonoko | itonoko+YJIT | nokogiri | Ratio |
 |---|---|---|---|---|
-| HTML parse | 2.37ms | 1.96ms | 0.26ms | 9.1× |
-| XML parse | 1.71ms | 1.46ms | 0.057ms | 30× |
-| CSS tag selector | 2.49ms | 1.98ms | 0.28ms | 8.9× |
-| CSS complex selector | 2.59ms | 2.03ms | 0.25ms | 10.3× |
-| XPath `//book` | 1.99ms | 1.52ms | 0.091ms | 21.8× |
-| NodeSet map | 2.58ms | 2.12ms | 0.27ms | 9.5× |
+| HTML parse | 1.15ms | 0.79ms | 0.21ms | 5.4× |
+| XML parse | 1.15ms | 0.71ms | 0.08ms | 14.4× |
+| CSS tag | 1.31ms | 0.83ms | 0.29ms | 4.5× |
+| CSS class | 1.23ms | 0.81ms | 0.30ms | 4.1× |
+| CSS complex | 1.33ms | 0.83ms | 0.27ms | 4.9× |
+| CSS attr | 1.19ms | 0.79ms | 0.24ms | 5.0× |
+| CSS :nth-child | 1.23ms | 0.82ms | 0.31ms | 3.9× |
+| XPath `//book` | 1.11ms | 0.77ms | 0.14ms | 7.7× |
+| XPath predicate | 1.17ms | 0.78ms | 0.13ms | 8.8× |
+| XPath `text()` | 1.16ms | 0.76ms | 0.06ms | 18.1× |
+| NodeSet map | 1.17ms | 0.89ms | 0.32ms | 3.7× |
+| to_html | 1.25ms | 0.91ms | 0.27ms | 4.6× |
 
-YJIT provides ~29% average speedup for itonoko. nokogiri uses libxml2 (C) so YJIT has minimal effect on it.
+YJIT provides ~1.5× average speedup for itonoko. nokogiri uses libxml2 (C) so YJIT has minimal effect on it.
 
 Run the benchmark yourself:
 
