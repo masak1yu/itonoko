@@ -7,9 +7,11 @@ Gem::Specification.new do |spec|
   spec.version     = Itonoko::VERSION
   spec.authors     = ["masak1yu"]
   spec.email       = ["antilogic@hey.com"]
-  spec.summary     = "Pure Ruby nokogiri-compatible HTML/XML parser"
-  spec.description = "A pure Ruby implementation of nokogiri with no native extensions"
-  spec.license     = "MIT"
+  spec.summary        = "Pure Ruby nokogiri-compatible HTML/XML parser"
+  spec.description    = "A pure Ruby implementation of nokogiri with no native extensions"
+  spec.license        = "MIT"
+  spec.homepage       = "https://github.com/masak1yu/itonoko"
+  spec.metadata["source_code_uri"] = "https://github.com/masak1yu/itonoko"
 
   spec.files = Dir["lib/**/*.rb"]
   spec.require_paths = ["lib"]
