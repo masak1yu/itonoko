@@ -6,6 +6,9 @@ require_relative "../xml/node_set"
 module Itonoko
   module XPath
     class Evaluator
+      STEP_SPLIT_CACHE = {}
+      STEP_PARSE_CACHE = {}
+
       def initialize(context_node, namespaces = {})
         @context    = context_node
         @namespaces = namespaces
@@ -98,31 +101,32 @@ module Itonoko
       end
 
       def split_steps(expr)
-        steps = []
-        buf   = +""
-        depth = 0
-        i     = 0
-        while i < expr.length
-          c = expr[i]
-          if c == "["
-            depth += 1; buf << c
-          elsif c == "]"
-            depth -= 1; buf << c
-          elsif c == "/" && depth == 0
-            steps << buf unless buf.empty?
-            buf = +""
-            if expr[i + 1] == "/"
-              i += 1
-              steps << buf unless buf.empty?
-              buf = +"/"
+        STEP_SPLIT_CACHE[expr] ||= begin
+          steps = []
+          buf   = +""
+          depth = 0
+          i     = 0
+          while i < expr.length
+            c = expr[i]
+            if c == "["
+              depth += 1; buf << c
+            elsif c == "]"
+              depth -= 1; buf << c
+            elsif c == "/" && depth == 0
+              steps << buf.dup unless buf.empty?
+              buf.clear
+              if expr[i + 1] == "/"
+                i += 1
+                buf << "/"
+              end
+            else
+              buf << c
             end
-          else
-            buf << c
+            i += 1
           end
-          i += 1
+          steps << buf.dup unless buf.empty?
+          steps.freeze
         end
-        steps << buf unless buf.empty?
-        steps
       end
 
       def eval_step(step, context_nodes, result, seen)
@@ -152,29 +156,33 @@ module Itonoko
       end
 
       def parse_step(step)
-        return [:self,   "node()", []] if step == "."
-        return [:parent, "node()", []] if step == ".."
+        STEP_PARSE_CACHE[step] ||=
+          if step == "."
+            [:self,   "node()", []]
+          elsif step == ".."
+            [:parent, "node()", []]
+          else
+            predicates = []
+            main = step
+            while (m = main.match(/\[([^\[\]]*)\]\z/))
+              predicates.unshift(m[1])
+              main = main[0, main.rindex("[")]
+            end
 
-        predicates = []
-        main = step
-        while (m = main.match(/\[([^\[\]]*)\]\z/))
-          predicates.unshift(m[1])
-          main = main[0, main.rindex("[")]
-        end
+            axis      = :child
+            node_test = main
 
-        axis      = :child
-        node_test = main
+            if (idx = main.index("::"))
+              axis_str  = main[0, idx]
+              node_test = main[(idx + 2)..]
+              axis      = axis_from_str(axis_str)
+            elsif main.start_with?("@")
+              axis      = :attribute
+              node_test = main[1..]
+            end
 
-        if (idx = main.index("::"))
-          axis_str  = main[0, idx]
-          node_test = main[(idx + 2)..]
-          axis      = axis_from_str(axis_str)
-        elsif main.start_with?("@")
-          axis      = :attribute
-          node_test = main[1..]
-        end
-
-        [axis, node_test, predicates]
+            [axis, node_test, predicates]
+          end
       end
 
       def axis_from_str(str)

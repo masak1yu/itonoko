@@ -74,12 +74,9 @@ module Itonoko
       end
 
       def scan_until(sc, pattern)
-        content = +""
-        until sc.eos?
-          break if sc.scan(pattern)
-          content << sc.getch
-        end
-        content
+        hit = sc.scan_until(pattern)
+        return sc.rest.tap { sc.terminate } unless hit
+        hit[0, hit.length - sc.matched_size]
       end
 
       def scan_attributes(sc, attrs)

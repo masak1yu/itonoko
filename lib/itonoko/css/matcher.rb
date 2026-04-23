@@ -6,12 +6,14 @@ require_relative "../xml/node_set"
 module Itonoko
   module CSS
     class Matcher
+      SELECTOR_CACHE = {}
+
       def self.match(context_node, selector_str)
         new(context_node).match(selector_str)
       end
 
       def self.matches_selector?(node, selector_str)
-        groups = Parser.new.parse(selector_str)
+        groups = SELECTOR_CACHE[selector_str] ||= Parser.new.parse(selector_str)
         groups.any? { |group| matches_group_at?(node, group, group.length - 1) }
       end
 
@@ -20,7 +22,7 @@ module Itonoko
       end
 
       def match(selector_str)
-        groups = Parser.new.parse(selector_str)
+        groups = SELECTOR_CACHE[selector_str] ||= Parser.new.parse(selector_str)
         doc    = document_of(@context)
         seen   = {}
         result = []

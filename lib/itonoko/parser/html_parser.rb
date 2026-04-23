@@ -103,16 +103,11 @@ module Itonoko
       end
 
       # Scan until pattern; consume the pattern and return content before it.
+      # StringScanner#scan_until is a C method that advances in bulk.
       def scan_until(sc, pattern)
-        content = +""
-        until sc.eos?
-          if sc.scan(pattern)
-            break
-          else
-            content << sc.getch
-          end
-        end
-        content
+        hit = sc.scan_until(pattern)
+        return sc.rest.tap { sc.terminate } unless hit
+        hit[0, hit.length - sc.matched_size]
       end
 
       # Scan attributes into attrs hash.
@@ -135,9 +130,11 @@ module Itonoko
             else
               sc.scan(/[^\s>]+/) || ""
             end
-            attrs[attr_name.downcase] = decode_entities(val)
+            k = attr_name.match?(/[A-Z]/) ? attr_name.downcase : attr_name
+            attrs[k] = decode_entities(val)
           else
-            attrs[attr_name.downcase] = attr_name.downcase
+            k = attr_name.match?(/[A-Z]/) ? attr_name.downcase : attr_name
+            attrs[k] = k
           end
         end
       end
