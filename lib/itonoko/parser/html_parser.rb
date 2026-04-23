@@ -17,233 +17,146 @@ module Itonoko
 
       RAW_TEXT_ELEMENTS = %w[script style].to_set.freeze
 
-      # Elements that auto-close a previous open same/related element
       AUTO_CLOSE = {
-        "p"  => %w[p],
-        "li" => %w[li],
-        "dt" => %w[dt dd],
-        "dd" => %w[dd dt],
-        "td" => %w[td th],
-        "th" => %w[td th],
-        "tr" => %w[tr],
+        "p"        => %w[p],
+        "li"       => %w[li],
+        "dt"       => %w[dt dd],
+        "dd"       => %w[dd dt],
+        "td"       => %w[td th],
+        "th"       => %w[td th],
+        "tr"       => %w[tr],
         "colgroup" => %w[colgroup],
         "caption"  => %w[caption],
         "option"   => %w[option],
         "optgroup" => %w[optgroup option],
-        "rb"  => %w[rb rt rtc rp],
-        "rt"  => %w[rb rt rp],
-        "rp"  => %w[rb rt rtc rp],
-        "rtc" => %w[rb rtc rp],
+        "rb"       => %w[rb rt rtc rp],
+        "rt"       => %w[rb rt rp],
+        "rp"       => %w[rb rt rtc rp],
+        "rtc"      => %w[rb rtc rp],
       }.freeze
-
-      # Implied end tags for implicit closing
-      IMPLIED_END_CLOSED_BY = {
-        "li" => %w[ul ol],
-        "dt" => %w[dl],
-        "dd" => %w[dl],
-        "tr" => %w[table tbody thead tfoot],
-        "td" => %w[tr table tbody thead tfoot],
-        "th" => %w[tr table tbody thead tfoot],
-        "colgroup" => %w[table],
-        "caption"  => %w[table],
-      }.freeze
-
-      Token = Struct.new(:type, :name, :attrs, :self_closing, :data, keyword_init: true)
 
       def parse(html)
-        @doc = HTML::Document.new
+        @doc        = HTML::Document.new
         @doc.errors = []
-        tokens = tokenize(html)
-        build_tree(tokens)
+        @open_stack = [@doc]
+        @buf        = +""          # reused mutable buffer, never reallocated
+        tokenize_and_build(StringScanner.new(html.to_s))
         @doc
       end
 
       private
 
-      # ── Tokenizer ────────────────────────────────────────────────
+      # Single-pass: tokenize and build the DOM tree simultaneously.
+      # No Token objects, no intermediate token array.
+      def tokenize_and_build(sc)
+        until sc.eos?
+          if sc.scan(/<!--/)
+            flush_buf
+            comment = scan_until(sc, /-->|--!>/)
+            @open_stack.last.append_child(XML::Comment.new(comment, @doc))
 
-      def tokenize(html)
-        scanner = StringScanner.new(html.to_s)
-        tokens  = []
-        buf     = +""
+          elsif sc.scan(/<!\[CDATA\[/)
+            flush_buf
+            cdata = scan_until(sc, /\]\]>/)
+            @open_stack.last.append_child(XML::CDATA.new(cdata, @doc))
 
-        until scanner.eos?
-          if scanner.scan(/<!--/)
-            flush_text(tokens, buf)
-            buf = +""
-            comment = +""
-            until scanner.eos?
-              if scanner.scan(/--!?>/)
-                break
-              elsif scanner.scan(/-->/)
-                break
-              else
-                comment << scanner.getch
-              end
-            end
-            tokens << Token.new(type: :comment, data: comment)
+          elsif sc.scan(/<!DOCTYPE/i)
+            sc.scan(/[^>]*/)
+            sc.scan(/>/)
 
-          elsif scanner.scan(/<!\[CDATA\[/)
-            flush_text(tokens, buf)
-            buf = +""
-            cdata = +""
-            until scanner.eos?
-              if scanner.scan(/\]\]>/)
-                break
-              else
-                cdata << scanner.getch
-              end
-            end
-            tokens << Token.new(type: :cdata, data: cdata)
+          elsif sc.scan(/<\//)
+            flush_buf
+            name = (sc.scan(/[^\s>\/]+/) || "").downcase
+            sc.scan(/[^>]*/)
+            sc.scan(/>/)
+            handle_end_tag(name)
 
-          elsif scanner.scan(/<!DOCTYPE/i)
-            flush_text(tokens, buf)
-            buf = +""
-            scanner.scan(/[^>]*/)
-            scanner.scan(/>/)
-            tokens << Token.new(type: :doctype)
+          elsif sc.scan(/</) && sc.check(/[a-zA-Z_!]/)
+            flush_buf
+            name  = (sc.scan(/[^\s>\/]+/) || "").downcase
+            attrs = {}
 
-          elsif scanner.scan(/<\//)
-            flush_text(tokens, buf)
-            buf = +""
-            name = scanner.scan(/[^\s>\/]+/) || ""
-            scanner.scan(/[^>]*/)
-            scanner.scan(/>/)
-            tokens << Token.new(type: :end_tag, name: name.downcase)
-
-          elsif scanner.scan(/</)
-            # Check if it's a valid start tag
-            if scanner.check(/[a-zA-Z_!]/)
-              flush_text(tokens, buf)
-              buf = +""
-              name = scanner.scan(/[^\s>\/]+/) || ""
-              name = name.downcase
-              attrs = {}
-              self_closing = false
-
-              # Raw text elements: consume everything until closing tag
-              if RAW_TEXT_ELEMENTS.include?(name)
-                # Parse attributes first
-                parse_attributes(scanner, attrs)
-                self_closing = scanner.scan(/\//)
-                scanner.scan(/>/)
-                tokens << Token.new(type: :start_tag, name: name, attrs: attrs, self_closing: self_closing)
-                unless self_closing
-                  raw = +""
-                  end_pattern = /<\/#{Regexp.escape(name)}\s*>/i
-                  until scanner.eos?
-                    if scanner.check(end_pattern)
-                      break
-                    else
-                      raw << scanner.getch
-                    end
-                  end
-                  tokens << Token.new(type: :characters, data: raw) unless raw.empty?
-                  if scanner.scan(end_pattern)
-                    tokens << Token.new(type: :end_tag, name: name)
-                  end
-                end
-              else
-                parse_attributes(scanner, attrs)
-                self_closing = !scanner.scan(/\//).nil?
-                scanner.scan(/>/)
-                tokens << Token.new(type: :start_tag, name: name, attrs: attrs, self_closing: self_closing)
+            if RAW_TEXT_ELEMENTS.include?(name)
+              scan_attributes(sc, attrs)
+              self_closing = sc.scan(/\//) ? true : false
+              sc.scan(/>/)
+              handle_start_tag(name, attrs, self_closing)
+              unless self_closing
+                raw = scan_until(sc, /<\/#{Regexp.escape(name)}\s*>/i)
+                @open_stack.last.append_child(XML::Text.new(raw, @doc)) unless raw.empty?
+                handle_end_tag(name)
               end
             else
-              buf << "<"
+              scan_attributes(sc, attrs)
+              self_closing = sc.scan(/\//) ? true : false
+              sc.scan(/>/)
+              handle_start_tag(name, attrs, self_closing)
             end
 
+          elsif (chunk = sc.scan(/[^<]+/))
+            @buf << chunk
           else
-            buf << scanner.getch
+            @buf << sc.getch
           end
         end
-
-        flush_text(tokens, buf)
-        tokens
+        flush_buf
       end
 
-      def parse_attributes(scanner, attrs)
+      # Scan until pattern; consume the pattern and return content before it.
+      def scan_until(sc, pattern)
+        content = +""
+        until sc.eos?
+          if sc.scan(pattern)
+            break
+          else
+            content << sc.getch
+          end
+        end
+        content
+      end
+
+      # Scan attributes into attrs hash.
+      def scan_attributes(sc, attrs)
         loop do
-          scanner.scan(/\s+/)
-          break if scanner.eos? || scanner.check(/[>\/]/)
-
-          attr_name = scanner.scan(/[^\s=>\/"']+/)
-          break unless attr_name
-
-          scanner.scan(/\s*/)
-          if scanner.scan(/=/)
-            scanner.scan(/\s*/)
-            if scanner.scan(/"/)
-              val = scanner.scan(/[^"]*/)
-              scanner.scan(/"/)
-              attrs[attr_name.downcase] = decode_entities(val || "")
-            elsif scanner.scan(/'/)
-              val = scanner.scan(/[^']*/)
-              scanner.scan(/'/)
-              attrs[attr_name.downcase] = decode_entities(val || "")
+          sc.scan(/\s+/)
+          break if sc.eos? || sc.check(/[>\/]/)
+          attr_name = sc.scan(/[^\s=>\/"']+/) or break
+          sc.scan(/\s*/)
+          if sc.scan(/=/)
+            sc.scan(/\s*/)
+            val = if sc.scan(/"/)
+              v = sc.scan(/[^"]*/) || ""
+              sc.scan(/"/)
+              v
+            elsif sc.scan(/'/)
+              v = sc.scan(/[^']*/) || ""
+              sc.scan(/'/)
+              v
             else
-              val = scanner.scan(/[^\s>]+/) || ""
-              attrs[attr_name.downcase] = decode_entities(val)
+              sc.scan(/[^\s>]+/) || ""
             end
+            attrs[attr_name.downcase] = decode_entities(val)
           else
             attrs[attr_name.downcase] = attr_name.downcase
           end
         end
       end
 
-      def flush_text(tokens, buf)
-        return if buf.empty?
-        text = decode_entities(buf)
-        tokens << Token.new(type: :characters, data: text)
-        buf.clear
+      def flush_buf
+        return if @buf.empty?
+        text = decode_entities(@buf)
+        @open_stack.last.append_child(XML::Text.new(text, @doc)) unless (@open_stack.length == 1 && text.strip.empty?)
+        @buf.clear
       end
 
       def decode_entities(str)
+        # Always return a new string so @buf.clear doesn't clobber the copy
+        # stored in XML::Text#content.
+        return str.dup unless str.include?("&")
         str.gsub(/&([^;\s]{1,10});/) { Parser.decode_entity($1) }
       end
 
-      # ── Tree Builder ─────────────────────────────────────────────
-
-      def build_tree(tokens)
-        @open_stack = [@doc]
-
-        tokens.each do |token|
-          case token.type
-          when :doctype
-            # ignore, already have an HTML document
-
-          when :start_tag
-            handle_start_tag(token)
-
-          when :end_tag
-            handle_end_tag(token)
-
-          when :characters
-            current = @open_stack.last
-            # Skip pure whitespace outside any non-document node when stack is just @doc
-            if @open_stack.length == 1 && token.data.strip.empty?
-              next
-            end
-            text_node = XML::Text.new(token.data, @doc)
-            current.add_child(text_node)
-
-          when :comment
-            current = @open_stack.last
-            comment_node = XML::Comment.new(token.data, @doc)
-            current.add_child(comment_node)
-
-          when :cdata
-            current = @open_stack.last
-            cdata_node = XML::CDATA.new(token.data, @doc)
-            current.add_child(cdata_node)
-          end
-        end
-      end
-
-      def handle_start_tag(token)
-        name = token.name
-
-        # Auto-close logic
+      def handle_start_tag(name, attrs, self_closing)
         if (closeable = AUTO_CLOSE[name])
           while @open_stack.length > 1 && closeable.include?(@open_stack.last.node_name)
             @open_stack.pop
@@ -251,24 +164,14 @@ module Itonoko
         end
 
         node = XML::Node.new(XML::Node::ELEMENT_NODE, name, @doc)
-        token.attrs.each { |k, v| node[k] = v }
-
-        @open_stack.last.add_child(node)
-
-        unless VOID_ELEMENTS.include?(name) || token.self_closing
-          @open_stack.push(node)
-        end
+        attrs.each { |k, v| node[k] = v }
+        @open_stack.last.append_child(node)
+        @open_stack.push(node) unless VOID_ELEMENTS.include?(name) || self_closing
       end
 
-      def handle_end_tag(token)
-        name = token.name
-
-        # Find matching open element in stack
+      def handle_end_tag(name)
         idx = @open_stack.rindex { |n| n.node_name == name }
-        return unless idx && idx > 0
-
-        # Pop everything down to and including that element
-        @open_stack.slice!(idx..)
+        @open_stack.slice!(idx..) if idx && idx > 0
       end
     end
   end

@@ -12,7 +12,7 @@ module Itonoko
 
       def self.matches_selector?(node, selector_str)
         groups = Parser.new.parse(selector_str)
-        groups.any? { |group| new(nil).matches_group?(node, group) }
+        groups.any? { |group| matches_group_at?(node, group, group.length - 1) }
       end
 
       def initialize(context_node)
@@ -25,76 +25,59 @@ module Itonoko
         seen   = {}
         result = []
 
-        all_elements(@context).each do |node|
-          next if seen[node.object_id]
-          if groups.any? { |group| matches_group?(node, group) }
+        all_elements(@context, result)
+        result.select! do |node|
+          unless seen[node.object_id]
             seen[node.object_id] = true
-            result << node
+            groups.any? { |group| self.class.matches_group_at?(node, group, group.length - 1) }
           end
         end
 
         XML::NodeSet.new(doc, result)
       end
 
-      # Returns true if node matches the given selector group (list of Steps).
-      def matches_group?(node, steps)
-        return false if steps.empty?
+      # Index-based group match — no Array slicing, no array allocation for ancestor walk.
+      def self.matches_group_at?(node, steps, idx)
+        return false unless node.node_type == XML::Node::ELEMENT_NODE
+        return false unless matches_simple?(node, steps[idx].simple)
+        return true  if idx == 0
 
-        # The rightmost step must match the node itself.
-        last_step = steps.last
-        return false unless matches_simple?(node, last_step.simple)
+        combinator = steps[idx].combinator || " "
+        prev_idx   = idx - 1
 
-        # Walk leftward through the remaining steps.
-        remaining = steps[0..-2]
-        return true if remaining.empty?
-
-        prev_step = remaining.last
-        combinator = last_step.combinator || " "
-
-        candidate_ancestors = candidates_for_combinator(node, combinator)
-        candidate_ancestors.any? do |candidate|
-          matches_group?(candidate, remaining)
-        end
-      end
-
-      private
-
-      def candidates_for_combinator(node, combinator)
         case combinator
         when ">"
-          node.parent ? [node.parent] : []
+          par = node.parent
+          par && par.node_type == XML::Node::ELEMENT_NODE &&
+            matches_group_at?(par, steps, prev_idx)
+
         when "+"
-          prev = node.previous_sibling
-          prev = prev.previous_sibling while prev && prev.node_type != XML::Node::ELEMENT_NODE
-          prev ? [prev] : []
+          sib = node.previous_sibling
+          sib = sib.previous_sibling while sib && sib.node_type != XML::Node::ELEMENT_NODE
+          sib && matches_group_at?(sib, steps, prev_idx)
+
         when "~"
-          collect_preceding_siblings(node)
-        else  # " " (descendant)
-          collect_ancestors(node)
+          sib = node.previous_sibling
+          while sib
+            return true if sib.node_type == XML::Node::ELEMENT_NODE &&
+                           matches_group_at?(sib, steps, prev_idx)
+            sib = sib.previous_sibling
+          end
+          false
+
+        else  # " " descendant
+          cur = node.parent
+          while cur
+            return false if cur.node_type == XML::Node::DOCUMENT_NODE
+            return true  if cur.node_type == XML::Node::ELEMENT_NODE &&
+                            matches_group_at?(cur, steps, prev_idx)
+            cur = cur.parent
+          end
+          false
         end
       end
 
-      def collect_ancestors(node)
-        result = []
-        current = node.parent
-        while current && current.node_type != XML::Node::DOCUMENT_NODE
-          result << current if current.node_type == XML::Node::ELEMENT_NODE
-          current = current.parent
-        end
-        result
-      end
-
-      def collect_preceding_siblings(node)
-        result = []
-        current = node.previous_sibling
-        while current
-          result << current if current.node_type == XML::Node::ELEMENT_NODE
-          current = current.previous_sibling
-        end
-        result
-      end
-
-      def matches_simple?(node, simple)
+      def self.matches_simple?(node, simple)
         return false unless node.node_type == XML::Node::ELEMENT_NODE
         return false unless matches_tag?(node, simple.tag)
         return false unless simple.ids.all? { |id| node["id"] == id }
@@ -104,25 +87,34 @@ module Itonoko
         true
       end
 
-      def matches_tag?(node, tag)
+      # Compare tag without allocating downcased strings when not needed.
+      def self.matches_tag?(node, tag)
         return true if tag.nil? || tag == "*"
-        node.node_name.downcase == tag.downcase
+        nn = node.node_name
+        nn == tag || nn.downcase == tag
       end
 
-      def node_has_class?(node, cls)
-        classes = (node["class"] || "").split
-        classes.include?(cls)
+      # Avoid String#split — use String#index for O(1) space word-boundary check.
+      def self.node_has_class?(node, cls)
+        val = node["class"] or return false
+        len = cls.length
+        i   = 0
+        while (idx = val.index(cls, i))
+          before_ok = idx == 0          || val.getbyte(idx - 1) == 32
+          after_ok  = idx + len == val.length || val.getbyte(idx + len) == 32
+          return true if before_ok && after_ok
+          i = idx + 1
+        end
+        false
       end
 
-      def matches_attr?(node, attr_spec)
-        name  = attr_spec[:name]
-        op    = attr_spec[:op]
-        value = attr_spec[:value]
-
+      def self.matches_attr?(node, attr_spec)
+        name   = attr_spec[:name]
+        op     = attr_spec[:op]
+        value  = attr_spec[:value]
         actual = node[name]
         return !actual.nil? if op.nil?
-        return false if actual.nil?
-
+        return false        if actual.nil?
         case op
         when "="  then actual == value
         when "~=" then actual.split.include?(value)
@@ -134,78 +126,120 @@ module Itonoko
         end
       end
 
-      def matches_pseudo?(node, pseudo)
+      def self.matches_pseudo?(node, pseudo)
         name = pseudo[:name]
         arg  = pseudo[:arg]
 
         case name
         when "first-child"
-          element_siblings(node).first == node
+          first_element_child_of(node.parent) == node
         when "last-child"
-          element_siblings(node).last == node
+          last_element_child_of(node.parent) == node
         when "first-of-type"
-          same_type_siblings(node).first == node
+          first_of_type_in(node) == node
         when "last-of-type"
-          same_type_siblings(node).last == node
+          last_of_type_in(node) == node
         when "only-child"
-          element_siblings(node).length == 1
+          element_child_count(node.parent) == 1
         when "only-of-type"
-          same_type_siblings(node).length == 1
+          type_child_count(node.parent, node.node_name) == 1
         when "nth-child"
-          idx = element_siblings(node).index(node)
-          return false unless idx
-          nth_match?(idx + 1, parse_nth(arg))
+          i = element_index_of(node)
+          i && nth_match?(i, parse_nth(arg))
         when "nth-last-child"
-          siblings = element_siblings(node)
-          idx = siblings.index(node)
-          return false unless idx
-          nth_match?(siblings.length - idx, parse_nth(arg))
+          i = element_index_of(node)
+          i && nth_match?(element_child_count(node.parent) - i + 1, parse_nth(arg))
         when "nth-of-type"
-          siblings = same_type_siblings(node)
-          idx = siblings.index(node)
-          return false unless idx
-          nth_match?(idx + 1, parse_nth(arg))
+          i = type_index_of(node)
+          i && nth_match?(i, parse_nth(arg))
         when "nth-last-of-type"
-          siblings = same_type_siblings(node)
-          idx = siblings.index(node)
-          return false unless idx
-          nth_match?(siblings.length - idx, parse_nth(arg))
+          i = type_index_of(node)
+          i && nth_match?(type_child_count(node.parent, node.node_name) - i + 1, parse_nth(arg))
         when "empty"
-          node.children.none? { |c| c.node_type == XML::Node::ELEMENT_NODE || (c.is_a?(XML::Text) && !c.content.empty?) }
+          node.children.none? do |c|
+            c.node_type == XML::Node::ELEMENT_NODE ||
+              (c.is_a?(XML::Text) && !c.content.empty?)
+          end
         when "root"
           node.parent&.node_type == XML::Node::DOCUMENT_NODE
         when "not"
           return true unless arg && !arg.empty?
-          !Matcher.matches_selector?(node, arg)
-        when "checked"
-          node["checked"] || node["selected"]
-        when "disabled"
-          node["disabled"]
-        when "enabled"
-          !node["disabled"]
-        when "link", "visited", "hover", "focus", "active"
-          false  # dynamic pseudos not applicable
-        when "first-line", "first-letter", "before", "after"
-          false  # pseudo-elements
-        else
-          false
+          !matches_selector?(node, arg)
+        when "checked"  then node["checked"] || node["selected"]
+        when "disabled" then node["disabled"]
+        when "enabled"  then !node["disabled"]
+        else false
         end
       end
 
-      def element_siblings(node)
-        return [] unless node.parent
-        node.parent.children.select { |c| c.node_type == XML::Node::ELEMENT_NODE }
+      # ── sibling helpers (no Array allocation) ─────────────────
+
+      def self.first_element_child_of(parent)
+        return nil unless parent
+        parent.children.each { |c| return c if c.node_type == XML::Node::ELEMENT_NODE }
+        nil
       end
 
-      def same_type_siblings(node)
-        return [] unless node.parent
-        node.parent.children.select { |c| c.node_type == XML::Node::ELEMENT_NODE && c.node_name == node.node_name }
+      def self.last_element_child_of(parent)
+        return nil unless parent
+        last = nil
+        parent.children.each { |c| last = c if c.node_type == XML::Node::ELEMENT_NODE }
+        last
       end
 
-      def parse_nth(arg)
+      def self.element_child_count(parent)
+        return 0 unless parent
+        parent.children.count { |c| c.node_type == XML::Node::ELEMENT_NODE }
+      end
+
+      def self.element_index_of(node)
+        return nil unless node.parent
+        idx = 0
+        node.parent.children.each do |c|
+          next unless c.node_type == XML::Node::ELEMENT_NODE
+          idx += 1
+          return idx if c.equal?(node)
+        end
+        nil
+      end
+
+      def self.first_of_type_in(node)
+        return nil unless node.parent
+        name = node.node_name
+        node.parent.children.each do |c|
+          return c if c.node_type == XML::Node::ELEMENT_NODE && c.node_name == name
+        end
+        nil
+      end
+
+      def self.last_of_type_in(node)
+        return nil unless node.parent
+        name = node.node_name
+        last = nil
+        node.parent.children.each { |c| last = c if c.node_type == XML::Node::ELEMENT_NODE && c.node_name == name }
+        last
+      end
+
+      def self.type_index_of(node)
+        return nil unless node.parent
+        name = node.node_name
+        idx  = 0
+        node.parent.children.each do |c|
+          next unless c.node_type == XML::Node::ELEMENT_NODE && c.node_name == name
+          idx += 1
+          return idx if c.equal?(node)
+        end
+        nil
+      end
+
+      def self.type_child_count(parent, name)
+        return 0 unless parent
+        parent.children.count { |c| c.node_type == XML::Node::ELEMENT_NODE && c.node_name == name }
+      end
+
+      def self.parse_nth(arg)
         return { a: 0, b: 1 } unless arg
         arg = arg.strip.downcase
-
         case arg
         when "odd"  then { a: 2, b: 1 }
         when "even" then { a: 2, b: 0 }
@@ -222,9 +256,8 @@ module Itonoko
         end
       end
 
-      def nth_match?(index, nth)
-        a = nth[:a]
-        b = nth[:b]
+      def self.nth_match?(index, nth)
+        a, b = nth[:a], nth[:b]
         if a == 0
           index == b
         else
@@ -233,17 +266,13 @@ module Itonoko
         end
       end
 
-      def all_elements(root)
-        result = []
-        traverse(root, result)
-        result
-      end
+      private
 
-      def traverse(node, result)
-        node.children.each do |child|
+      def all_elements(root, result)
+        root.children.each do |child|
           if child.node_type == XML::Node::ELEMENT_NODE
             result << child
-            traverse(child, result)
+            all_elements(child, result)
           end
         end
       end

@@ -7,26 +7,27 @@ module Itonoko
   module XPath
     class Evaluator
       def initialize(context_node, namespaces = {})
-        @context   = context_node
+        @context    = context_node
         @namespaces = namespaces
       end
 
       def evaluate(expr)
-        nodes = eval_expr(expr.to_s.strip, [@context])
-        doc   = @context.is_a?(XML::Document) ? @context : @context.document
-        XML::NodeSet.new(doc, nodes.flatten.uniq { |n| n.object_id })
+        seen   = {}
+        result = []
+        eval_expr(expr.to_s.strip, [@context], result, seen)
+        doc = @context.is_a?(XML::Document) ? @context : @context.document
+        XML::NodeSet.new(doc, result)
       end
 
       private
 
-      # Entry: evaluate a full XPath expression from given context nodes.
-      def eval_expr(expr, context_nodes)
-        # Handle union
+      # Evaluate a full XPath expression, appending unique nodes into result.
+      def eval_expr(expr, context_nodes, result, seen)
         if (parts = split_union(expr)) && parts.length > 1
-          return parts.flat_map { |p| eval_expr(p.strip, context_nodes) }.uniq { |n| n.object_id }
+          parts.each { |p| eval_expr(p.strip, context_nodes, result, seen) }
+          return
         end
-
-        eval_location_path(expr, context_nodes)
+        eval_location_path(expr, context_nodes, result, seen)
       end
 
       def split_union(expr)
@@ -52,73 +53,68 @@ module Itonoko
         parts.length > 1 ? parts : nil
       end
 
-      # Evaluate a location path like //div/span[@class] or ./text()
-      def eval_location_path(expr, context_nodes)
-        return context_nodes if expr.empty?
+      def eval_location_path(expr, context_nodes, result, seen)
+        return context_nodes.each { |n| append_unique(n, result, seen) } if expr.empty?
 
-        # Absolute path: starts with //
         if expr.start_with?("//")
-          rest = expr[2..]
-          return eval_steps(rest, context_nodes, absolute: true, any_depth: true)
-        end
-
-        # Absolute path: starts with /
-        if expr.start_with?("/")
+          expanded = []
+          context_nodes.each { |n| expanded << n; all_descendants(n, expanded) }
+          eval_steps(expr[2..], expanded, result, seen)
+        elsif expr.start_with?("/")
           roots = context_nodes.map { |n| n.is_a?(XML::Document) ? n : n.document }.uniq
-          rest  = expr[1..]
-          return eval_steps(rest, roots, absolute: false, any_depth: false)
+          eval_steps(expr[1..], roots, result, seen)
+        else
+          eval_steps(expr, context_nodes, result, seen)
         end
-
-        eval_steps(expr, context_nodes, absolute: false, any_depth: false)
       end
 
-      def eval_steps(expr, context_nodes, absolute: false, any_depth: false)
-        if any_depth
-          context_nodes = context_nodes.flat_map { |n| [n] + all_descendants(n) }
+      def eval_steps(expr, context_nodes, result, seen)
+        steps = split_steps(expr)
+        if steps.empty?
+          context_nodes.each { |n| append_unique(n, result, seen) }
+          return
         end
 
-        steps = split_steps(expr)
-        return context_nodes if steps.empty?
-
-        first_step = steps.first
-        rest_steps = steps[1..]
-
-        result = eval_step(first_step, context_nodes)
-
-        rest_steps.each do |step|
+        current = context_nodes
+        steps.each_with_index do |step, i|
           any = step.start_with?("/")
           s   = any ? step[1..] : step
-          if any
-            result = result.flat_map { |n| [n] + all_descendants(n) }
-          end
-          result = eval_step(s, result)
-        end
 
-        result
+          if any
+            expanded = []
+            current.each { |n| expanded << n; all_descendants(n, expanded) }
+            current = expanded
+          end
+
+          if i == steps.length - 1
+            eval_step(s, current, result, seen)
+            return
+          else
+            buf = []
+            eval_step_raw(s, current, buf)
+            current = buf
+          end
+        end
       end
 
-      # Split "//foo/bar//baz" respecting brackets
       def split_steps(expr)
         steps = []
         buf   = +""
         depth = 0
         i     = 0
-
         while i < expr.length
           c = expr[i]
           if c == "["
-            depth += 1
-            buf << c
+            depth += 1; buf << c
           elsif c == "]"
-            depth -= 1
-            buf << c
+            depth -= 1; buf << c
           elsif c == "/" && depth == 0
             steps << buf unless buf.empty?
             buf = +""
             if expr[i + 1] == "/"
               i += 1
               steps << buf unless buf.empty?
-              buf = +"/"  # prefix next step with / to signal any-depth
+              buf = +"/"
             end
           else
             buf << c
@@ -129,24 +125,36 @@ module Itonoko
         steps
       end
 
-      def eval_step(step, context_nodes)
-        return context_nodes if step.nil? || step.empty?
+      def eval_step(step, context_nodes, result, seen)
+        return context_nodes.each { |n| append_unique(n, result, seen) } if step.nil? || step.empty?
 
-        # Parse axis::nodetest[predicates]
         axis, node_test, predicates = parse_step(step)
 
-        result = context_nodes.flat_map { |ctx| axis_nodes(ctx, axis) }
-        result = result.select { |n| matches_node_test?(n, node_test) }
-        predicates.each { |pred| result = apply_predicate(result, pred) }
-        result
+        candidates = []
+        context_nodes.each { |ctx| collect_axis_nodes(ctx, axis, candidates) }
+        candidates.select! { |n| matches_node_test?(n, node_test) }
+        predicates.each { |pred| candidates = apply_predicate(candidates, pred) }
+        candidates.each { |n| append_unique(n, result, seen) }
+      end
+
+      # Like eval_step but skips per-node dedup — safe for intermediate steps where
+      # context_nodes are already unique and :child traversal produces no duplicates.
+      def eval_step_raw(step, context_nodes, result)
+        return result.concat(context_nodes) if step.nil? || step.empty?
+
+        axis, node_test, predicates = parse_step(step)
+
+        candidates = []
+        context_nodes.each { |ctx| collect_axis_nodes(ctx, axis, candidates) }
+        candidates.select! { |n| matches_node_test?(n, node_test) }
+        predicates.each { |pred| candidates = apply_predicate(candidates, pred) }
+        result.concat(candidates)
       end
 
       def parse_step(step)
-        # Handle abbreviated steps
         return [:self,   "node()", []] if step == "."
         return [:parent, "node()", []] if step == ".."
 
-        # Separate predicates
         predicates = []
         main = step
         while (m = main.match(/\[([^\[\]]*)\]\z/))
@@ -154,14 +162,13 @@ module Itonoko
           main = main[0, main.rindex("[")]
         end
 
-        # Axis
-        axis = :child
+        axis      = :child
         node_test = main
 
         if (idx = main.index("::"))
           axis_str  = main[0, idx]
           node_test = main[(idx + 2)..]
-          axis = axis_from_str(axis_str)
+          axis      = axis_from_str(axis_str)
         elsif main.start_with?("@")
           axis      = :attribute
           node_test = main[1..]
@@ -182,27 +189,36 @@ module Itonoko
         when "following-sibling"  then :following_sibling
         when "preceding-sibling"  then :preceding_sibling
         when "attribute"          then :attribute
-        when "following"          then :following
-        when "preceding"          then :preceding
         else :child
         end
       end
 
-      def axis_nodes(ctx, axis)
+      # Append axis nodes directly into result (no intermediate array allocation).
+      def collect_axis_nodes(ctx, axis, result)
         case axis
-        when :child              then ctx.children
-        when :parent             then ctx.parent ? [ctx.parent] : []
-        when :self               then [ctx]
-        when :descendant         then all_descendants(ctx)
-        when :descendant_or_self then [ctx] + all_descendants(ctx)
-        when :ancestor           then ancestors(ctx)
-        when :ancestor_or_self   then [ctx] + ancestors(ctx)
-        when :following_sibling  then following_siblings(ctx)
-        when :preceding_sibling  then preceding_siblings(ctx)
-        when :attribute          then ctx.respond_to?(:attribute_nodes) ? ctx.attribute_nodes : []
-        when :following          then []  # complex; skipped
-        when :preceding          then []
-        else ctx.children
+        when :child
+          ch = ctx.children
+          result.concat(ch) unless ch.empty?
+        when :parent
+          result << ctx.parent if ctx.parent
+        when :self
+          result << ctx
+        when :descendant
+          all_descendants(ctx, result)
+        when :descendant_or_self
+          result << ctx
+          all_descendants(ctx, result)
+        when :ancestor
+          collect_ancestors_into(ctx, result)
+        when :ancestor_or_self
+          result << ctx
+          collect_ancestors_into(ctx, result)
+        when :following_sibling
+          collect_following_siblings_into(ctx, result)
+        when :preceding_sibling
+          collect_preceding_siblings_into(ctx, result)
+        when :attribute
+          ctx.attribute_nodes.each { |a| result << a } if ctx.respond_to?(:attribute_nodes)
         end
       end
 
@@ -217,85 +233,53 @@ module Itonoko
           node.node_type == XML::Node::ELEMENT_NODE || node.is_a?(XML::Attr)
         else
           local = test.include?(":") ? test.split(":", 2).last : test
-          node.node_name == local || (node.respond_to?(:name) && node.name == local)
+          node.node_name == local
         end
       end
 
       def apply_predicate(nodes, pred)
-        # Numeric predicate
         if pred =~ /\A\d+\z/
           idx = pred.to_i - 1
-          return idx >= 0 && idx < nodes.length ? [nodes[idx]] : []
+          return (idx >= 0 && idx < nodes.length) ? [nodes[idx]] : []
         end
-
-        # last()
         if pred == "last()"
           return nodes.last ? [nodes.last] : []
         end
-
-        # position() = n
         if (m = pred.match(/\Aposition\(\)\s*=\s*(\d+)\z/))
           idx = m[1].to_i - 1
-          return idx >= 0 && idx < nodes.length ? [nodes[idx]] : []
+          return (idx >= 0 && idx < nodes.length) ? [nodes[idx]] : []
         end
 
-        # Filter each node
-        nodes.select.with_index { |node, i| eval_predicate(node, pred, i, nodes.length) }
+        total = nodes.length
+        nodes.select.with_index { |node, i| eval_predicate(node, pred, i, total) }
       end
 
       def eval_predicate(node, pred, pos_index, total)
-        # Attribute existence: @attr
-        if pred =~ /\A@([\w\-:]+)\z/
-          return node.has_attribute?($1) rescue false
-
-        # @attr = 'value' or @attr = "value"
-        elsif pred =~ /\A@([\w\-:]+)\s*=\s*['"]([^'"]*)['"]\z/
-          return (node[$1] == $2) rescue false
-
-        # @attr != 'value'
-        elsif pred =~ /\A@([\w\-:]+)\s*!=\s*['"]([^'"]*)['"]\z/
-          return (node[$1] != $2) rescue false
-
-        # @attr contains/starts-with etc via contains()
-        elsif pred =~ /\Acontains\(@([\w\-:]+),\s*['"]([^'"]*)['"]\)\z/
-          val = node[$1] rescue nil
-          return val&.include?($2) || false
-
-        elsif pred =~ /\Astarts-with\(@([\w\-:]+),\s*['"]([^'"]*)['"]\)\z/
-          val = node[$1] rescue nil
-          return val&.start_with?($2) || false
-
-        # text() = 'value'
-        elsif pred =~ /\Atext\(\)\s*=\s*['"]([^'"]*)['"]\z/
-          return node.text == $1
-
-        # normalize-space() = 'value'
-        elsif pred =~ /\Anormalize-space\(\)\s*=\s*['"]([^'"]*)['"]\z/
-          return node.text.strip.gsub(/\s+/, " ") == $1
-
-        # contains(text(), 'value')
-        elsif pred =~ /\Acontains\(text\(\),\s*['"]([^'"]*)['"]\)\z/
-          return node.text.include?($1)
-
-        # position()
-        elsif pred =~ /\Aposition\(\)\s*([<>=!]+)\s*(\d+)\z/
-          op  = $1
-          val = $2.to_i
-          pos = pos_index + 1
-          compare(pos, op, val)
-
-        # last()
-        elsif pred == "last()"
+        case pred
+        when /\A@([\w\-:]+)\z/
+          node.has_attribute?($1) rescue false
+        when /\A@([\w\-:]+)\s*=\s*['"]([^'"]*)['"]\z/
+          (node[$1] == $2) rescue false
+        when /\A@([\w\-:]+)\s*!=\s*['"]([^'"]*)['"]\z/
+          (node[$1] != $2) rescue false
+        when /\Acontains\(@([\w\-:]+),\s*['"]([^'"]*)['"]\)\z/
+          (node[$1] || "").include?($2) rescue false
+        when /\Astarts-with\(@([\w\-:]+),\s*['"]([^'"]*)['"]\)\z/
+          (node[$1] || "").start_with?($2) rescue false
+        when /\Atext\(\)\s*=\s*['"]([^'"]*)['"]\z/
+          node.text == $1
+        when /\Anormalize-space\(\)\s*=\s*['"]([^'"]*)['"]\z/
+          node.text.strip.gsub(/\s+/, " ") == $1
+        when /\Acontains\(text\(\),\s*['"]([^'"]*)['"]\)\z/
+          node.text.include?($1)
+        when /\Aposition\(\)\s*([<>=!]+)\s*(\d+)\z/
+          compare(pos_index + 1, $1, $2.to_i)
+        when "last()"
           pos_index == total - 1
-
-        # not(...)
-        elsif pred =~ /\Anot\((.+)\)\z/
+        when /\Anot\((.+)\)\z/
           !eval_predicate(node, $1, pos_index, total)
-
-        # child element existence: tagname
-        elsif pred =~ /\A[a-zA-Z_][\w\-]*\z/
+        when /\A[a-zA-Z_][\w\-]*\z/
           node.children.any? { |c| c.node_type == XML::Node::ELEMENT_NODE && c.node_name == pred }
-
         else
           false
         end
@@ -313,39 +297,45 @@ module Itonoko
         end
       end
 
-      def all_descendants(node)
-        result = []
+      # Recursive accumulator — O(n) with no intermediate arrays.
+      def all_descendants(node, result = [])
         node.children.each do |child|
           result << child
-          result.concat(all_descendants(child))
+          all_descendants(child, result)
         end
         result
       end
 
-      def ancestors(node)
-        result = []
+      def collect_ancestors_into(node, result)
         current = node.parent
         while current
           result << current
           current = current.parent
         end
-        result
       end
 
-      def following_siblings(node)
-        return [] unless node.parent
+      def collect_following_siblings_into(node, result)
+        return unless node.parent
         siblings = node.parent.children
-        idx      = siblings.index(node)
-        return [] unless idx
-        siblings[(idx + 1)..]
+        idx = siblings.index(node)
+        return unless idx
+        (idx + 1).upto(siblings.length - 1) { |i| result << siblings[i] }
       end
 
-      def preceding_siblings(node)
-        return [] unless node.parent
+      def collect_preceding_siblings_into(node, result)
+        return unless node.parent
         siblings = node.parent.children
-        idx      = siblings.index(node)
-        return [] unless idx
-        siblings[0, idx].reverse
+        idx = siblings.index(node)
+        return unless idx
+        (idx - 1).downto(0) { |i| result << siblings[i] }
+      end
+
+      def append_unique(node, result, seen)
+        id = node.object_id
+        unless seen[id]
+          seen[id] = true
+          result << node
+        end
       end
     end
   end

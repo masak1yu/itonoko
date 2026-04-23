@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "cgi/escape"
+
 module Itonoko
   module XML
     class Node
@@ -13,8 +15,9 @@ module Itonoko
       DOCUMENT_TYPE_NODE          = 10
       DOCUMENT_FRAGMENT_NODE      = 11
 
-      ESCAPE_TEXT = { "&" => "&amp;", "<" => "&lt;", ">" => "&gt;" }.freeze
-      ESCAPE_ATTR = { "&" => "&amp;", "<" => "&lt;", ">" => "&gt;", '"' => "&quot;" }.freeze
+      # Shared frozen constants — leaf nodes use these to avoid per-node allocation.
+      EMPTY_ATTRS    = {}.freeze
+      EMPTY_CHILDREN = [].freeze
 
       attr_accessor :parent, :document
       attr_reader   :node_type, :node_name, :children
@@ -25,7 +28,7 @@ module Itonoko
         @document   = document
         @parent     = nil
         @children   = []
-        @attributes = {}
+        @attributes = EMPTY_ATTRS  # upgraded to mutable hash on first write
       end
 
       # ── navigation ────────────────────────────────────────────────
@@ -89,7 +92,11 @@ module Itonoko
       end
 
       def []=(attr_name, value)
-        @attributes[attr_name.to_s] = value.to_s
+        if @attributes.frozen?
+          @attributes = { attr_name.to_s => value.to_s }
+        else
+          @attributes[attr_name.to_s] = value.to_s
+        end
       end
 
       def get_attribute(name)
@@ -97,10 +104,11 @@ module Itonoko
       end
 
       def set_attribute(name, value)
-        @attributes[name.to_s] = value.to_s
+        self[name] = value
       end
 
       def remove_attribute(name)
+        return if @attributes.frozen?
         @attributes.delete(name.to_s)
       end
 
@@ -119,10 +127,10 @@ module Itonoko
       end
 
       def attributes
-        @attributes.transform_values { |v| Attr.new(nil, v, document) }
-                   .tap do |h|
-                     @attributes.each_key { |k| h[k].name = k }
-                   end
+        @attributes.each_with_object({}) do |(k, v), h|
+          a = Attr.new(k, v, document)
+          h[k] = a
+        end
       end
 
       def attribute_nodes
@@ -131,17 +139,33 @@ module Itonoko
 
       # ── content ───────────────────────────────────────────────────
 
+      # Accumulator-based text extraction — avoids intermediate arrays and join.
       def text
-        children.map(&:text).join
+        buf = +""
+        _collect_text(buf)
+        buf
       end
       alias content text
       alias inner_text text
 
+      # Override in subclasses for leaf nodes.
+      def _collect_text(buf)
+        @children.each { |c| c._collect_text(buf) }
+      end
+
       def text=(str)
-        @children = [Text.new(str.to_s, document)]
-        @children.first.parent = self
+        @children = [Text.new(str.to_s, document).tap { |t| t.parent = self }]
       end
       alias content= text=
+
+      # ── fast path for parsers (skips parent-removal + coercion) ───
+
+      def append_child(node)
+        node.parent   = self
+        node.document = @document
+        @children << node
+        node
+      end
 
       # ── tree manipulation ─────────────────────────────────────────
 
@@ -171,7 +195,7 @@ module Itonoko
       def add_next_sibling(node_or_markup)
         raise "no parent" unless parent
         nodes = coerce_nodes(node_or_markup)
-        idx = parent.children.index(self) + 1
+        idx   = parent.children.index(self) + 1
         nodes.each_with_index do |node, i|
           node.parent&.children&.delete(node)
           node.parent   = parent
@@ -185,7 +209,7 @@ module Itonoko
       def add_previous_sibling(node_or_markup)
         raise "no parent" unless parent
         nodes = coerce_nodes(node_or_markup)
-        idx = parent.children.index(self)
+        idx   = parent.children.index(self)
         nodes.each_with_index do |node, i|
           node.parent&.children&.delete(node)
           node.parent   = parent
@@ -206,7 +230,7 @@ module Itonoko
       def replace(node_or_markup)
         raise "no parent" unless parent
         nodes = coerce_nodes(node_or_markup)
-        idx = parent.children.index(self)
+        idx   = parent.children.index(self)
         parent.children.delete_at(idx)
         nodes.reverse_each do |node|
           node.parent   = parent
@@ -259,8 +283,11 @@ module Itonoko
 
       # ── serialization ─────────────────────────────────────────────
 
+      # String concat instead of map+join — one less intermediate Array.
       def inner_html
-        children.map { |c| c.to_html }.join
+        buf = +""
+        @children.each { |c| buf << c.to_html }
+        buf
       end
 
       def to_html
@@ -275,7 +302,7 @@ module Itonoko
         when PROCESSING_INSTRUCTION_NODE
           "<?#{node_name}?>"
         when DOCUMENT_NODE, DOCUMENT_FRAGMENT_NODE
-          children.map { |c| c.to_html }.join
+          inner_html
         else
           ""
         end
@@ -294,7 +321,9 @@ module Itonoko
         when PROCESSING_INSTRUCTION_NODE
           "<?#{node_name}?>"
         when DOCUMENT_NODE, DOCUMENT_FRAGMENT_NODE
-          children.map { |c| c.to_xml }.join
+          buf = +""
+          @children.each { |c| buf << c.to_xml(options) }
+          buf
         else
           ""
         end
@@ -347,16 +376,16 @@ module Itonoko
       ].freeze
 
       def serialize_element(html_mode)
-        tag  = node_name
-        attr = serialize_attributes
-        open_tag = "<#{tag}#{attr}>"
+        tag      = node_name
+        attr_str = serialize_attributes
+        open_tag = "<#{tag}#{attr_str}>"
 
         if html_mode && VOID_ELEMENTS.include?(tag.downcase)
           return open_tag
         end
 
-        if children.empty?
-          return html_mode ? "#{open_tag}</#{tag}>" : "<#{tag}#{attr}/>"
+        if @children.empty?
+          return html_mode ? "#{open_tag}</#{tag}>" : "<#{tag}#{attr_str}/>"
         end
 
         "#{open_tag}#{inner_html}</#{tag}>"
@@ -364,17 +393,18 @@ module Itonoko
 
       def serialize_attributes
         return "" if @attributes.empty?
-        @attributes.map do |k, v|
-          %( #{k}="#{escape_attr(v)}")
-        end.join
+        buf = +""
+        @attributes.each { |k, v| buf << %( #{k}="#{escape_attr(v)}") }
+        buf
       end
 
+      # CGI.escapeHTML is a C implementation — fastest available escape.
       def escape_text(str)
-        str.to_s.gsub(/[&<>]/, ESCAPE_TEXT)
+        CGI.escapeHTML(str.to_s)
       end
 
       def escape_attr(str)
-        str.to_s.gsub(/[&<>"]/,  ESCAPE_ATTR)
+        CGI.escapeHTML(str.to_s)
       end
 
       def coerce_nodes(node_or_markup)

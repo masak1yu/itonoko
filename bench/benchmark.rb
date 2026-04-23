@@ -126,6 +126,8 @@ BENCH_SCRIPT = <<~'RUBY'
   puts JSON.generate(results)
 RUBY
 
+RUBY_BIN = RbConfig.ruby  # full path to current Ruby interpreter
+
 def run_engine(engine, html_file, xml_file, yjit: false)
   script = Tempfile.new(["bench_", ".rb"])
   script.write(BENCH_SCRIPT)
@@ -141,7 +143,7 @@ def run_engine(engine, html_file, xml_file, yjit: false)
   }
 
   env_str = env.map { |k, v| "#{k}=#{v.shellescape}" }.join(" ")
-  cmd = "ruby #{ruby_flags} -I#{LIB_DIR.shellescape} #{script.path}"
+  cmd = "#{RUBY_BIN.shellescape} #{ruby_flags} -I#{LIB_DIR.shellescape} #{script.path}"
   output = `env #{env_str} #{cmd} 2>/dev/null`
   JSON.parse(output)
 rescue => e
